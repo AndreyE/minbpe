@@ -9,7 +9,10 @@ Unlike BasicTokenizer:
 - RegexTokenizer handles optional special tokens.
 """
 
+from collections import defaultdict
 import regex as re
+import time
+
 from .base import Tokenizer, get_stats, merge
 
 
@@ -23,24 +26,41 @@ GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1
 
 
 def _collect_chunks(lines, pattern):
+        vocab = {0: b'\xef\xbf\xbd'} # '�'
+        char_ids = defaultdict(int)
+
         # split the text up into text chunks
         def chars_gen(lines):
+            count = 0
+            mib = 0
+            start_time = time.perf_counter()
             try:
                 for line in lines:
                     for char in line:
+                        b_char = char.encode('utf-8')
+                        if char not in char_ids:
+                            idx = len(vocab) + 1
+                            vocab[idx] = b_char # TODO: get rid of extra encoding/decoding
+                            char_ids[char] = idx
+                        count += len(b_char)
+                        if count // 1024**2 >= mib:
+                            end_time = time.perf_counter()
+                            print(f'Reading {count // 1024**2} MiB in {end_time - start_time} sec.')
+                            start_time = end_time
+                            mib += 1
                         yield char
             except UnicodeDecodeError as err:
                 print(f'Skipping {line} due to {err}')
 
-        def chunks_gen(lines):
+        def id_chunks_gen(lines):
             buffer = []
             for char in chars_gen(lines):
                 try:
                     buffer += char
-                    chunks = pattern.findall(''.join(buffer))
-                    if len(chunks) > 1:
-                        del buffer[:len(chunks[0])]
-                        yield chunks[0]
+                    text_chunks = pattern.findall(''.join(buffer))
+                    if len(text_chunks) > 1:
+                        del buffer[:len(text_chunks[0])]
+                        yield tuple(char_ids[ch] for ch in text_chunks[0])
                 except UnicodeDecodeError as err:
                     print(err)
 
@@ -49,10 +69,9 @@ def _collect_chunks(lines, pattern):
                     yield chunk
 
         chunks = {}
-        for chunk in chunks_gen(lines):
-            chunk = tuple(chunk.encode('utf-8'))
+        for chunk in id_chunks_gen(lines):
             chunks[chunk] = chunks.get(chunk, 0) + 1
-        return chunks
+        return char_ids, vocab, chunks
 
 
 def _count_pairs(chunks):
@@ -101,25 +120,20 @@ class RegexTokenizer(Tokenizer):
         self.compiled_pattern = re.compile(self.pattern)
         self.special_tokens = {}
         self.inverse_special_tokens = {}
-        self.vocab = {idx: bytes([idx]) for idx in range(256)} # idx -> bytes
-        self.merges = {}
 
     def train(self, input, vocab_size, verbose=False):
-        assert vocab_size >= SIZEOF_CHAR
-        num_merges = vocab_size - SIZEOF_CHAR
-
-        merges = {}
-        vocab = self.vocab.copy()
-
         # split the text up into text chunks
-        chunks = _collect_chunks(input, self.compiled_pattern)
+        char_ids, vocab, chunks = _collect_chunks(input, self.compiled_pattern)
         del input
+
+        num_merges = vocab_size - len(vocab) - 1
+        merges = {}
 
         for i in range(num_merges):
             counted_pairs = _count_pairs(chunks)
             max_pair = max(counted_pairs, key=counted_pairs.get)
 
-            idx = len(vocab)
+            idx = len(vocab) + 1
             merges[max_pair] = idx
             vocab[idx] = vocab[max_pair[0]] + vocab[max_pair[1]]
 
@@ -129,8 +143,9 @@ class RegexTokenizer(Tokenizer):
             chunks = _replace_pair(max_pair, chunks, idx)
 
         # save class variables
-        self.merges = merges # used in encode()
+        self.char_ids = char_ids
         self.vocab = vocab   # used in decode()
+        self.merges = merges # used in encode()
 
     def register_special_tokens(self, special_tokens):
         # special_tokens is a dictionary of str -> int
@@ -152,10 +167,10 @@ class RegexTokenizer(Tokenizer):
         text = text_bytes.decode("utf-8", errors="replace")
         return text
 
-    def _encode_chunk(self, text_bytes):
+    def _encode_chunk(self, chunk):
         # return the token ids
         # let's begin. first, convert all bytes to integers in range 0..255
-        ids = list(text_bytes)
+        ids = [self.char_ids[char] for char in chunk]
         while len(ids) >= 2:
             # find the pair with the lowest merge index
             stats = get_stats(ids)
@@ -178,8 +193,7 @@ class RegexTokenizer(Tokenizer):
         # all chunks of text are encoded separately, then results are joined
         ids = []
         for chunk in text_chunks:
-            chunk_bytes = chunk.encode("utf-8") # raw bytes
-            chunk_ids = self._encode_chunk(chunk_bytes)
+            chunk_ids = self._encode_chunk(chunk)
             ids.extend(chunk_ids)
         return ids
 
