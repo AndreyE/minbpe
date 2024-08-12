@@ -22,9 +22,34 @@ GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 
-def _collect_chunks(text, pattern):
+def _collect_chunks(lines, pattern):
+        # split the text up into text chunks
+        def chars_gen(lines):
+            try:
+                for line in lines:
+                    for char in line:
+                        yield char
+            except UnicodeDecodeError as err:
+                print(f'Skipping {line} due to {err}')
+
+        def chunks_gen(lines):
+            buffer = []
+            for char in chars_gen(lines):
+                try:
+                    buffer += char
+                    chunks = pattern.findall(''.join(buffer))
+                    if len(chunks) > 1:
+                        del buffer[:len(chunks[0])]
+                        yield chunks[0]
+                except UnicodeDecodeError as err:
+                    print(err)
+
+            if buffer:
+                for chunk in pattern.findall(''.join(buffer)):
+                    yield chunk
+
         chunks = {}
-        for chunk in re.findall(pattern, text):
+        for chunk in chunks_gen(lines):
             chunk = tuple(chunk.encode('utf-8'))
             chunks[chunk] = chunks.get(chunk, 0) + 1
         return chunks
@@ -79,7 +104,7 @@ class RegexTokenizer(Tokenizer):
         self.vocab = {idx: bytes([idx]) for idx in range(256)} # idx -> bytes
         self.merges = {}
 
-    def train(self, text, vocab_size, verbose=False):
+    def train(self, input, vocab_size, verbose=False):
         assert vocab_size >= SIZEOF_CHAR
         num_merges = vocab_size - SIZEOF_CHAR
 
@@ -87,8 +112,8 @@ class RegexTokenizer(Tokenizer):
         vocab = self.vocab.copy()
 
         # split the text up into text chunks
-        chunks = _collect_chunks(text, self.compiled_pattern)
-        del text
+        chunks = _collect_chunks(input, self.compiled_pattern)
+        del input
 
         for i in range(num_merges):
             counted_pairs = _count_pairs(chunks)
