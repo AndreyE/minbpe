@@ -13,10 +13,54 @@ import regex as re
 from .base import Tokenizer, get_stats, merge
 
 
+SIZEOF_CHAR = 256
+
+
 # the main GPT text split patterns, see
 # https://github.com/openai/tiktoken/blob/main/tiktoken_ext/openai_public.py
 GPT2_SPLIT_PATTERN = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 GPT4_SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+
+
+def _collect_chunks(text, pattern):
+        chunks = {}
+        for chunk in re.findall(pattern, text):
+            chunk = tuple(chunk.encode('utf-8'))
+            chunks[chunk] = chunks.get(chunk, 0) + 1
+        return chunks
+
+
+def _count_pairs(chunks):
+    pairs = {}
+    for chunk, count in chunks.items():
+        for pair in zip(chunk[:-1], chunk[1:]):
+            pair = tuple(pair)
+            pairs[pair] = pairs.get(pair, 0) + count
+    return pairs
+
+
+def _replace_pair(pair, chunks, idx):
+    def replacer(chunk):
+        i = 0
+        while i < len(chunk) - 1:
+            if chunk[i:i+2] == pair:
+                yield idx
+                i += 2
+            else:
+                yield chunk[i]
+                i += 1
+
+        if i < len(chunk):
+            assert i == len(chunk) - 1
+            yield chunk[i]
+
+    r_chunks = {}
+    for chunk, count in chunks.items():
+        r_chunk = tuple(replacer(chunk))
+        if len(r_chunk) > 1:
+            r_chunks[r_chunk] = count
+
+    return r_chunks
 
 
 class RegexTokenizer(Tokenizer):
@@ -32,38 +76,32 @@ class RegexTokenizer(Tokenizer):
         self.compiled_pattern = re.compile(self.pattern)
         self.special_tokens = {}
         self.inverse_special_tokens = {}
+        self.vocab = {idx: bytes([idx]) for idx in range(256)} # idx -> bytes
+        self.merges = {}
 
     def train(self, text, vocab_size, verbose=False):
-        assert vocab_size >= 256
-        num_merges = vocab_size - 256
+        assert vocab_size >= SIZEOF_CHAR
+        num_merges = vocab_size - SIZEOF_CHAR
+
+        merges = {}
+        vocab = self.vocab.copy()
 
         # split the text up into text chunks
-        text_chunks = re.findall(self.compiled_pattern, text)
+        chunks = _collect_chunks(text, self.compiled_pattern)
+        del text
 
-        # input text preprocessing
-        ids = [list(ch.encode("utf-8")) for ch in text_chunks]
-
-        # iteratively merge the most common pairs to create new tokens
-        merges = {} # (int, int) -> int
-        vocab = {idx: bytes([idx]) for idx in range(256)} # idx -> bytes
         for i in range(num_merges):
-            # count the number of times every consecutive pair appears
-            stats = {}
-            for chunk_ids in ids:
-                # passing in stats will update it in place, adding up counts
-                get_stats(chunk_ids, stats)
-            # find the pair with the highest count
-            pair = max(stats, key=stats.get)
-            # mint a new token: assign it the next available id
-            idx = 256 + i
-            # replace all occurrences of pair in ids with idx
-            ids = [merge(chunk_ids, pair, idx) for chunk_ids in ids]
-            # save the merge
-            merges[pair] = idx
-            vocab[idx] = vocab[pair[0]] + vocab[pair[1]]
-            # prints
+            counted_pairs = _count_pairs(chunks)
+            max_pair = max(counted_pairs, key=counted_pairs.get)
+
+            idx = len(vocab)
+            merges[max_pair] = idx
+            vocab[idx] = vocab[max_pair[0]] + vocab[max_pair[1]]
+
             if verbose:
-                print(f"merge {i+1}/{num_merges}: {pair} -> {idx} ({vocab[idx]}) had {stats[pair]} occurrences")
+                print(f"merge {i+1}/{num_merges}: {max_pair} -> {idx} ({vocab[idx].decode('utf-8', errors='replace')}) had {counted_pairs[max_pair]} occurrences")
+
+            chunks = _replace_pair(max_pair, chunks, idx)
 
         # save class variables
         self.merges = merges # used in encode()
